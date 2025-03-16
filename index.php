@@ -6,7 +6,9 @@ $username = "root";   // Default for local setup
 $password = "mysql";       // Empty for XAMPP/Laragon (modify if needed)
 $database = "ait_system"; // Your database name
 
-\Stripe\Stripe::setApiKey('sk_test_51HI6TSFquywMGGx2rUy7plzXXlhFS6FptdjqTCExbT0jk6BSWIPCWF4edFU1iZArQSiEaZeuJiKotsIINrd52LKF00SZL9VV0g');
+\Stripe\Stripe::setApiKey('sk_test_2jmwp9D5RaBaGEKT2gs9UpTL00l1usSfAl');
+
+$product_id = 'prod_RxCXozfAQKeR8W';
 
 // Create a connection
 $conn = new mysqli($host, $username, $password, $database);
@@ -21,6 +23,8 @@ $sql = "SELECT
     s.id, 
        s.user_id, 
        s.gateway_customer_id, 
+       s.gateway_product_id,
+       s.gateway_price_id,
        s.subscription_type_id, 
        s.payment_type_id, 
        s.product_id, 
@@ -57,7 +61,7 @@ JOIN country ON user.country_id = country.id
         AND active = 1    -- Only active subscriptions
         AND renewed = 0
         AND payment_type_id = 5 
-        LIMIT 2 , 2
+        LIMIT 1 , 1
         ";
 $result = $conn->query($sql);
 
@@ -78,7 +82,7 @@ if ($result->num_rows > 0) {
         'items.0.price',                           // Stripe Price ID
 //        'items.0.quantity',                        // Default quantity (1 for one subscription)
         'add_invoice_items.0.product',     // Product ID for added invoice item
-        'add_invoice_items.0.amount',      // Amount to add to invoice (in cents)
+//        'add_invoice_items.0.amount',      // Amount to add to invoice (in cents)
         'add_invoice_items.0.currency',     // Currency (e.g., usd)
 //        'automatic_tax',                   // Stripe tax (true/false)
         'cancel_at_period_end',            // If true, the subscription will cancel at the end of the period
@@ -97,10 +101,6 @@ if ($result->num_rows > 0) {
 
     // Fetch the rows and write each to the CSV
     while ($row = $result->fetch_assoc()) {
-        $product_id = 'prod_RwhODpt1eyufeh';
-
-        // Ensure price is valid and converted to Stripe Price ID
-        $price = 'price_1R2o04FquywMGGx2jhYO4umD';
 
         // Calculate amount in cents
         $amount = $row['price'] * 100;
@@ -131,37 +131,35 @@ if ($result->num_rows > 0) {
         $third_party_sub_id = $row['transaction_id'];  // Assuming this maps to subscription ID
 
     // Use the new customer ID
-        $stripe_customer_id = $row['gateway_customer_id'];
+        $stripe_customer_id = get_customer_id($row);
 
-        $existing_customers = \Stripe\Customer::all([
-            'email' => $row['email'],
-            'limit' => 1
-        ]);
+        $strip_price_id = get_price_id($product_id, $row);
+        $strip_price_id = !$strip_price_id ? $row['gateway_price_id'] : $strip_price_id;
 
-        if(empty($existing_customers->data)) {
-            $customer = \Stripe\Customer::create([
-                'email' => $row['email'],
-                'name' => $row['user_name'],
-            ]);
+        $updates = [];
+        if ($stripe_customer_id !== $row['gateway_customer_id']) {
+            $updates[] = "gateway_customer_id = '{$stripe_customer_id}'";
+        }
+        if ($product_id !== $row['gateway_product_id']) {
+            $updates[] = "gateway_product_id = '{$product_id}'";
+        }
+        if ($strip_price_id !== $row['gateway_price_id']) {
+            $updates[] = "gateway_price_id = '{$strip_price_id}'";
+        }
 
-            $update_query = "UPDATE subscription SET gateway_customer_id = '{$customer->id}' WHERE id = {$row['id']}";
-            if ($conn->query($update_query)) {
-
-                // Use the new customer ID
-                $stripe_customer_id = $customer->id;
-            } else {
-                exit('Error: ' . $conn->error);
-            }
+        if (!empty($updates)) {
+            $update_query = "UPDATE subscription SET " . implode(', ', $updates) . " WHERE id = {$row['id']}";
+            $conn->query($update_query);
         }
 
         // Prepare the data row
         $data = [
             $stripe_customer_id,                     // Stripe Customer ID (not user_id)
             $start_date,                          // Unix timestamp for start date
-            $price,                            // The Stripe Price ID
+            $strip_price_id,                            // The Stripe Price ID
 //            '1',                                    // Default quantity is 1 for a single subscription
             $product_id,                          // The product ID in Stripe
-            $amount,                              // Amount to charge (in cents)
+//            $amount,                              // Amount to charge (in cents)
             $currency,                            // Currency
 //            'false',                              // Set to 'true' if Stripe tax is enabled
             $cancel_at_period_end,                // If the subscription will cancel at the end
@@ -188,5 +186,123 @@ if ($result->num_rows > 0) {
 
 // Close the database connection
 $conn->close();
+
+// Main function to get or create a customer ID
+function get_customer_id($row)
+{
+    // Check if gateway_customer_id is empty
+    if (empty($row['gateway_customer_id'])) {
+        // Search for an existing customer by email
+        $existingCustomerId = findCustomerByEmail($row['email']);
+
+        // If a customer with the same email exists, return their ID
+        if ($existingCustomerId) {
+            return $existingCustomerId;
+        }
+
+        // If no customer exists, create a new one
+        return createCustomer($row['email'], $row['user_name']);
+    } else {
+        try {
+            // Retrieve the existing customer from Stripe
+            $existing_customer = \Stripe\Customer::retrieve($row['gateway_customer_id']);
+
+            // Check if the customer exists and has not been deleted
+            if ($existing_customer && !isset($existing_customer->deleted)) {
+                return $row['gateway_customer_id'];
+            }
+
+            // If the customer is deleted or invalid, search by email
+            $existingCustomerId = findCustomerByEmail($row['email']);
+
+            // If a customer with the same email exists, return their ID
+            if ($existingCustomerId) {
+                return $existingCustomerId;
+            }
+
+            // If no customer exists, create a new one
+            return createCustomer($row['email'], $row['user_name']);
+        } catch (\Stripe\Exception\InvalidRequestException $e) {
+            // Handle the case where the customer ID is invalid or does not exist
+            if ($e->getHttpStatus() === 404) {
+                // Search for an existing customer by email
+                $existingCustomerId = findCustomerByEmail($row['email']);
+
+                // If a customer with the same email exists, return their ID
+                if ($existingCustomerId) {
+                    return $existingCustomerId;
+                }
+
+                // If no customer exists, create a new one
+                return createCustomer($row['email'], $row['user_name']);
+            } else {
+                // Re-throw the exception if it's not a 404 error
+                throw $e;
+            }
+        } catch (\Stripe\Exception\ApiErrorException $e) {
+            // Handle other Stripe API errors
+            throw $e;
+        }
+    }
+}
+
+// Helper function to search for a customer by email
+function findCustomerByEmail($email) {
+    try {
+        $existingCustomers = \Stripe\Customer::all([
+            'email' => $email,
+            'limit' => 1,
+        ]);
+        return !empty($existingCustomers->data) ? $existingCustomers->data[0]->id : null;
+    } catch (\Stripe\Exception\ApiErrorException $e) {
+        // Handle Stripe API errors
+        throw $e;
+    }
+}
+
+// Helper function to create a new customer
+function createCustomer($email, $name) {
+    try {
+        $customer = \Stripe\Customer::create([
+            'email' => $email,
+            'name' => $name,
+        ]);
+        return $customer->id;
+    } catch (\Stripe\Exception\ApiErrorException $e) {
+        // Handle Stripe API errors
+        throw $e;
+    }
+}
+
+function get_price_id($product_id, $row)
+{
+    $unit_amount = $row['price'] * 100;
+    $prices = \Stripe\Price::all([
+        'product' => $product_id, // Product ID
+        'active' => true, // Only active Prices
+    ]);
+
+    // Step 2: Check if a Price with the same amount, currency, and interval exists
+    foreach ($prices->data as $price) {
+        if ($price->unit_amount == $unit_amount &&
+            $price->currency == 'usd' &&
+            $price->recurring->interval == 'year') {
+            return $price->id; // Return existing Price ID
+        }
+    }
+
+    $price = \Stripe\Price::create([
+        'product' => $product_id, // Replace with your Product ID
+        'unit_amount' => $unit_amount, // Price in cents (e.g., $149.00)
+        'currency' => 'usd', // Currency
+        'recurring' => [
+            'interval' => 'year', // Billing interval (e.g., 'month' or 'year')
+        ],
+    ]);
+
+    if($price->id) {
+        return $price->id;
+    }
+}
 
 ?>
